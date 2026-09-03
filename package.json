@@ -1,0 +1,16 @@
+{
+  "scripts": {
+    "import-clients": "node scripts/import-clients.js",
+    "verify-client": "node scripts/verify-client-lookup.js",
+    "smoke-browserbase": "node scripts/smoke-browserbase.js"
+  },
+  "dependencies": {
+    "@browserbasehq/sdk": "^2.19.0",
+    "@sendgrid/mail": "^8.1.6",
+    "@supabase/supabase-js": "^2.57.4",
+    "dotenv": "^17.4.2",
+    "node-telegram-bot-api": "^2.1.0",
+    "playwright": "^1.62.1",
+    "playwright-core": "^1.62.1"
+  }
+}

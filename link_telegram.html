@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <style>
+    body {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      margin: 0;
+      background-color: #f0f4f8;
+      font-family: sans-serif;
+    }
+
+    /* Container controlling the vertical layout */
+    .card {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 24px;
+    }
+
+    .btn {
+      background-color: #0088cc;
+      color: white;
+      padding: 12px 24px;
+      border-radius: 6px;
+      text-decoration: none;
+      font-weight: bold;
+    }
+
+    .qr-code {
+      width: 200px;
+      height: 200px;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="card">
+    <!-- Button on Top -->
+    <a href="https://t.me/dice_apply_bot" class="btn">Chat with our Telegram Bot</a>
+    <centre>OR</centre>
+    Scan QR Code below:
+    <!-- QR Code Below -->
+    <img src="BotDice.png" alt="Telegram Bot QR Code" class="qr-code">
+  </div>
+
+</body>
+</html>
