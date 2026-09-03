@@ -8,6 +8,9 @@ const { fillCurrentStep, isVisibleEnabled, loadApplyProfile } = require('./lib/d
 const { openBrowser, closeBrowser, useBrowserbase, maxConcurrent } = require('./lib/browser');
 const { createApplyQueue } = require('./lib/apply-queue');
 const { startApplyWorkers } = require('./lib/apply-worker');
+const { sendIMessage, getPhoneHandleForClient } = require('./lib/bluebubbles');
+
+const imessageEnabled = Boolean(process.env.BB_SERVER_URL && process.env.BB_PASSWORD);
 
 const botToken = process.env.BOT_TOKEN;
 const allowedChatId = process.env.CHAT_ID ? Number(process.env.CHAT_ID) : null;
@@ -54,7 +57,17 @@ function stateFor(chatId) {
 
 // === TELEGRAM HELPERS ===
 function sendMessage(chatId, text, options = {}) {
+  if (!chatId || isNaN(Number(chatId))) return Promise.resolve();
   return bot.api.sendMessage({ chat_id: chatId, text, ...options }).catch(console.error);
+}
+
+function notifyIMessage(clientId, text) {
+  if (!imessageEnabled || !clientId) return;
+  getPhoneHandleForClient(supabase, clientId)
+    .then((phone) => {
+      if (phone) return sendIMessage(phone, text);
+    })
+    .catch((err) => console.error('[iMessage notification error]:', err.message));
 }
 
 function sendMessageWithButtons(chatId, text, buttons) {
@@ -417,7 +430,7 @@ async function getJobName(page) {
   return company ? `${jobTitle} (${company})` : jobTitle;
 }
 
-async function applyToJobOnPage(page, jobName, url, chatId) {
+async function applyToJobOnPage(page, jobName, url, chatId, clientId = null) {
   await waitRandom(5, 15, 'After opening URL');
 
   const applyButton = page.getByTestId('apply-button');
@@ -447,13 +460,14 @@ async function applyToJobOnPage(page, jobName, url, chatId) {
   if (!applicationPage.url().includes('dice.com')) {
     await saveAppliedJob(chatId, url, jobName, 'external');
     sendMessage(chatId, `⚠️ Skipped ${jobName}: Redirected to external site.`);
+    notifyIMessage(clientId, `⚠️ Skipped ${jobName}: Redirected to external site.`);
     return false;
   }
 
-  const clientId = await getClientIdForChat(chatId);
-  const applyProfile = await loadApplyProfile(supabase, clientId);
+  const resolvedClientId = clientId || await getClientIdForChat(chatId);
+  const applyProfile = await loadApplyProfile(supabase, resolvedClientId);
   console.log('[apply-questions] loaded profile', {
-    clientId: clientId || null,
+    clientId: resolvedClientId || null,
     hasOffice: applyProfile.can_work_3_days_in_office ?? null,
   });
 
@@ -471,6 +485,7 @@ async function applyToJobOnPage(page, jobName, url, chatId) {
     } catch (e) {
       await saveAppliedJob(chatId, url, jobName, 'external_or_failed');
       sendMessage(chatId, `⚠️ Skipped ${jobName}: Missing Next/Submit (likely an extra question we could not fill).`);
+      notifyIMessage(clientId, `⚠️ Skipped ${jobName}: Missing Next/Submit (additional question required).`);
       return false;
     }
 
@@ -486,12 +501,14 @@ async function applyToJobOnPage(page, jobName, url, chatId) {
       if (!filled.ok) {
         await saveAppliedJob(chatId, url, jobName, 'external_or_failed');
         sendMessage(chatId, `⚠️ Skipped ${jobName}: ${filled.reason || 'Could not answer an application question.'}`);
+        notifyIMessage(clientId, `⚠️ Skipped ${jobName}: ${filled.reason || 'Could not answer an application question.'}`);
         return false;
       }
 
       if (!await isVisibleEnabled(nextButton)) {
         await saveAppliedJob(chatId, url, jobName, 'external_or_failed');
         sendMessage(chatId, `⚠️ Skipped ${jobName}: Next stayed disabled after filling questions.`);
+        notifyIMessage(clientId, `⚠️ Skipped ${jobName}: Next stayed disabled after filling questions.`);
         return false;
       }
 
@@ -516,32 +533,39 @@ async function applyToJobOnPage(page, jobName, url, chatId) {
 
     await saveAppliedJob(chatId, url, jobName, 'completed');
     sendMessage(chatId, `✅ Application submitted successfully for:\n${jobName}`);
+    notifyIMessage(clientId, `✅ Application submitted successfully for:\n${jobName}`);
     return true;
   }
 
   await saveAppliedJob(chatId, url, jobName, 'failed');
   sendMessage(chatId, `⚠️ Skipped ${jobName}: Could not complete application.`);
+  notifyIMessage(clientId, `⚠️ Skipped ${jobName}: Could not complete application.`);
   return false;
 }
 
 // Runs one queued apply on Browserbase/local. Throws on hard failure.
 async function executeQueuedApply(job) {
-  const chatId = Number(job.telegram_chat_id);
+  const chatId = job.telegram_chat_id ? Number(job.telegram_chat_id) : null;
+  const clientId = job.client_id;
   const url = job.url;
 
-  await sendMessage(chatId, `Starting application from queue:\n${url}`);
+  if (chatId) {
+    await sendMessage(chatId, `Starting application from queue:\n${url}`);
+  }
 
-  let activeSession = await readActiveSession(chatId);
+  let activeSession = chatId ? await readActiveSession(chatId) : null;
   if (!activeSession) {
-    activeSession = await refreshLogin(chatId);
+    if (chatId) {
+      activeSession = await refreshLogin(chatId);
+    }
   }
 
   let handle = await openBrowser({
-    storageState: activeSession.storageState,
+    storageState: activeSession?.storageState,
     headless: useBrowserbase,
   });
   if (handle.sessionId) {
-    console.log(`[User ${chatId}] Apply browser session: ${handle.sessionId}`);
+    console.log(`[User ${chatId || clientId}] Apply browser session: ${handle.sessionId}`);
   }
 
   try {
@@ -554,10 +578,12 @@ async function executeQueuedApply(job) {
         await page.waitForTimeout(3000);
 
         if (page.url().includes('/login')) {
-          activeSession = await refreshLogin(chatId);
+          if (chatId) {
+            activeSession = await refreshLogin(chatId);
+          }
           await closeBrowser(handle);
           handle = await openBrowser({
-            storageState: activeSession.storageState,
+            storageState: activeSession?.storageState,
             headless: useBrowserbase,
           });
           retryAfterLogin = true;
@@ -565,19 +591,24 @@ async function executeQueuedApply(job) {
         }
 
         const jobName = await getJobName(page);
-        await applyToJobOnPage(page, jobName, url, chatId);
+        await applyToJobOnPage(page, jobName, url, chatId, clientId);
       } catch (error) {
         if (error.code === 'SESSION_EXPIRED') {
-          activeSession = await refreshLogin(chatId);
+          if (chatId) {
+            activeSession = await refreshLogin(chatId);
+          }
           await closeBrowser(handle);
           handle = await openBrowser({
-            storageState: activeSession.storageState,
+            storageState: activeSession?.storageState,
             headless: useBrowserbase,
           });
           retryAfterLogin = true;
         } else {
           await saveAppliedJob(chatId, url, 'Failed', 'failed');
-          sendMessage(chatId, `Failed to apply: ${error.message}`);
+          if (chatId) {
+            sendMessage(chatId, `Failed to apply: ${error.message}`);
+          }
+          notifyIMessage(clientId, `⚠️ Failed to apply to ${url}: ${error.message}`);
           throw error;
         }
       } finally {
