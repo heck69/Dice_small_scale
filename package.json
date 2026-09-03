@@ -2,6 +2,7 @@
   "scripts": {
     "start": "node index.js",
     "start:imessage": "node imessage-orchestrator.js",
+    "test": "node --test test/*.test.js",
     "import-clients": "node scripts/import-clients.js",
     "verify-client": "node scripts/verify-client-lookup.js",
     "smoke-browserbase": "node scripts/smoke-browserbase.js"

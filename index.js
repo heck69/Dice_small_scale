@@ -8,9 +8,9 @@ const { fillCurrentStep, isVisibleEnabled, loadApplyProfile } = require('./lib/d
 const { openBrowser, closeBrowser, useBrowserbase, maxConcurrent } = require('./lib/browser');
 const { createApplyQueue } = require('./lib/apply-queue');
 const { startApplyWorkers } = require('./lib/apply-worker');
-const { sendIMessage, getPhoneHandleForClient } = require('./lib/bluebubbles');
+const { notifyIMessage } = require('./lib/loopmessage');
 
-const imessageEnabled = Boolean(process.env.BB_SERVER_URL && process.env.BB_PASSWORD);
+const imessageEnabled = Boolean(process.env.LOOPMESSAGE_API_KEY);
 
 const botToken = process.env.BOT_TOKEN;
 const allowedChatId = process.env.CHAT_ID ? Number(process.env.CHAT_ID) : null;

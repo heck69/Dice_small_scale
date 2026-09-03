@@ -1,205 +1,160 @@
 require('dotenv').config();
-
-const { createServiceClient } = require('./lib/supabase');
+const http = require('http');
+const { createClient } = require('@supabase/supabase-js');
+const { createWebhookApp } = require('./lib/webhook-server');
+const { startIMessageScheduler } = require('./lib/imessage-scheduler');
+const { ensureDefaultSender } = require('./lib/sender-pool');
 const { createApplyQueue } = require('./lib/apply-queue');
-const { createWebhookServer } = require('./lib/webhook-server');
-const { offerJobViaIMessage, handleIMessageReply } = require('./lib/imessage-bot');
-const { sendIMessage, normalizePhone } = require('./lib/bluebubbles');
+const { startApplyWorkers } = require('./lib/apply-worker');
+const { notifyIMessage } = require('./lib/loopmessage');
+const { openBrowser, closeBrowser, useBrowserbase } = require('./lib/browser');
+const { fillCurrentStep, loadApplyProfile, isVisibleEnabled } = require('./lib/dice-apply-questions');
 
-const BB_URL = process.env.BB_SERVER_URL;
-const BB_PASSWORD = process.env.BB_PASSWORD;
-const WEBHOOK_PORT = Number(process.env.WEBHOOK_PORT || 3001);
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
-const POLL_MS = 10000;
-const EXPIRY_MS = 27 * 60 * 1000; // 27 minutes
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY;
+const PORT = process.env.PORT || 3001;
 
-if (!BB_URL || !BB_PASSWORD) {
-  console.error('[iMessage] Fatal: BB_SERVER_URL and BB_PASSWORD must be configured in .env');
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  console.error('[orchestrator] FATAL: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in .env');
   process.exit(1);
 }
 
-const supabase = createServiceClient();
-const applyQueue = createApplyQueue(supabase);
-
-const sessionOfferedCache = new Map(); // clientId -> Set<jobUrl>
-
-function wasOfferedThisSession(clientId, jobUrl) {
-  return sessionOfferedCache.get(clientId)?.has(jobUrl) ?? false;
-}
-
-function markOffered(clientId, jobUrl) {
-  if (!sessionOfferedCache.has(clientId)) sessionOfferedCache.set(clientId, new Set());
-  sessionOfferedCache.get(clientId).add(jobUrl);
-}
-
-async function readActiveJobs() {
-  const { data, error } = await supabase
-    .from('jobs')
-    .select('id, url')
-    .eq('active', true)
-    .order('created_at', { ascending: true });
-  if (error) { console.error('[iMessage] Failed to query jobs:', error.message); return []; }
-  return data || [];
-}
-
-async function getClientsWithValidPhone() {
-  const { data, error } = await supabase
-    .from('clients')
-    .select('id, callable_phone')
-    .not('callable_phone', 'is', null)
-    .neq('callable_phone', '');
-  if (error) { console.error('[iMessage] Failed to query clients:', error.message); return []; }
-
-  const results = [];
-  for (const c of data || []) {
-    const norm = normalizePhone(c.callable_phone);
-    if (norm) results.push({ clientId: c.id, phoneHandle: norm });
-  }
-  return results;
-}
-
-async function isJobHandledForClient(clientId, jobUrl) {
-  const { data: app } = await supabase
-    .from('applications')
-    .select('id')
-    .eq('client_id', clientId)
-    .eq('url', jobUrl)
-    .maybeSingle();
-  if (app) return true;
-
-  const { data: q } = await supabase
-    .from('apply_queue')
-    .select('id')
-    .eq('client_id', clientId)
-    .eq('url', jobUrl)
-    .maybeSingle();
-  if (q) return true;
-
-  return false;
-}
-
-async function saveRejectedJob(clientId, jobUrl) {
-  const { data: job } = await supabase.from('jobs').select('id').eq('url', jobUrl).maybeSingle();
-  await supabase.from('applications').upsert(
-    {
-      client_id:        clientId,
-      telegram_chat_id: null,
-      job_id:           job?.id || null,
-      url:              jobUrl,
-      job_name:         'Skipped via iMessage',
-      status:           'rejected',
-      applied_at:       new Date().toISOString(),
-    },
-    { onConflict: 'client_id,url' }
-  );
-}
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 /**
- * 27-Minute Expiration Scanner:
- * Scans for stale active offers, marks them expired, and notifies client.
+ * Executes a single queued apply job using headless Chromium on Azure.
+ * @param {object} queueJob
  */
-async function checkExpiredOffers() {
-  const { data: pendingOffers, error } = await supabase
-    .from('imessage_pending_jobs')
-    .select('*')
-    .eq('status', 'offered');
+async function processQueuedApplyJob(queueJob) {
+  const clientId = queueJob.client_id;
+  const url = queueJob.url;
+  const jobTitle = queueJob.job_name || 'Job Opportunity';
 
-  if (error || !pendingOffers) return;
+  console.log(`[worker] Processing apply job for client ${clientId} -> ${url}`);
 
-  const now = Date.now();
-  for (const offer of pendingOffers) {
-    const age = now - new Date(offer.offered_at).getTime();
-    if (age > EXPIRY_MS) {
-      console.log(`[iMessage] Expiring 27-minute offer for client ${offer.client_id} (job: ${offer.job_url})`);
+  // Fetch client session and profile
+  const { data: sessionData } = await supabase
+    .from('dice_sessions')
+    .select('storage_state')
+    .eq('client_id', clientId)
+    .maybeSingle();
 
-      await supabase.from('imessage_pending_jobs')
-        .update({ status: 'expired', updated_at: new Date().toISOString() })
-        .eq('id', offer.id);
+  const profile = await loadApplyProfile(supabase, clientId);
 
-      await sendIMessage(
-        offer.phone_handle,
-        `⏱️ The 27-minute response window for the previous job has expired.\nMoving on to search for your next job!`
-      ).catch(console.error);
+  let handle = null;
+  try {
+    handle = await openBrowser({
+      storageState: sessionData?.storage_state || null,
+      headless: true,
+    });
+
+    const page = handle.page;
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForTimeout(3000);
+
+    // Click Apply / Easy Apply if available
+    const applyButtonSelector = 'button:has-text("Apply"), button:has-text("Easy Apply"), a:has-text("Apply Now")';
+    const applyButton = page.locator(applyButtonSelector).first();
+    if (await applyButton.isVisible({ timeout: 5000 }).catch(() => false)) {
+      await applyButton.click();
+      await page.waitForTimeout(3000);
     }
-  }
-}
 
-/**
- * Main Job Polling Loop
- */
-async function runIMessageJobLoop() {
-  console.log('[iMessage] Orchestrator loop started.');
-
-  while (true) {
-    try {
-      // 1. Process 27-minute expirations first
-      await checkExpiredOffers();
-
-      // 2. Poll jobs and clients
-      const [jobs, clients] = await Promise.all([readActiveJobs(), getClientsWithValidPhone()]);
-
-      for (const { clientId, phoneHandle } of clients) {
-        // Check if user currently has an active, unexpired offer
-        const { data: activeOffer } = await supabase
-          .from('imessage_pending_jobs')
-          .select('id, job_url, status')
-          .eq('client_id', clientId)
-          .eq('status', 'offered')
-          .maybeSingle();
-
-        if (activeOffer) {
-          // User already has an unanswered offer waiting
-          continue;
-        }
-
-        // Find next eligible job for this client
-        for (const job of jobs) {
-          if (wasOfferedThisSession(clientId, job.url)) continue;
-          if (await isJobHandledForClient(clientId, job.url)) {
-            markOffered(clientId, job.url);
-            continue;
-          }
-
-          // Offer the job
-          await offerJobViaIMessage(supabase, {
-            clientId,
-            phoneHandle,
-            jobUrl: job.url,
-            jobId:  job.id,
-          });
-
-          markOffered(clientId, job.url);
-          await new Promise(r => setTimeout(r, 1000)); // Rate limit buffer between users
-          break; // Move to next client after offering 1 job
-        }
+    // Step through form filling questions
+    let maxSteps = 10;
+    while (maxSteps-- > 0) {
+      const stepResult = await fillCurrentStep(page, profile);
+      if (stepResult.completed || stepResult.submitted) {
+        break;
       }
-    } catch (err) {
-      console.error('[iMessage] Loop error:', err.message);
+      if (stepResult.blocked) {
+        throw new Error(stepResult.reason || 'Blocked on form question');
+      }
+      await page.waitForTimeout(2000);
     }
 
-    await new Promise(r => setTimeout(r, POLL_MS));
+    // Record application in Supabase
+    await supabase.from('applications').insert({
+      client_id: clientId,
+      job_url: url,
+      job_id: queueJob.job_id,
+      notes: `Applied successfully via iMessage queue (${jobTitle})`,
+      status: 'applied',
+    });
+
+    // Send success receipt over iMessage
+    const successMsg = `✅ Successfully applied to ${jobTitle} on Dice!`;
+    await notifyIMessage(supabase, clientId, successMsg);
+    console.log(`[worker] Success receipt sent to client ${clientId}`);
+  } catch (err) {
+    console.error(`[worker] Application failed for client ${clientId}:`, err.message);
+
+    // Record failure in Supabase
+    await supabase.from('applications').insert({
+      client_id: clientId,
+      job_url: url,
+      job_id: queueJob.job_id,
+      notes: `Failed via iMessage queue: ${err.message}`,
+      status: 'failed',
+    });
+
+    // Send failure receipt over iMessage
+    const failureMsg = `⚠️ Application failed for ${jobTitle}: ${err.message}`;
+    await notifyIMessage(supabase, clientId, failureMsg);
+    throw err;
+  } finally {
+    if (handle) {
+      await closeBrowser(handle);
+    }
   }
 }
 
-// Start Webhook Server
-createWebhookServer({
-  port: WEBHOOK_PORT,
-  secretToken: WEBHOOK_SECRET,
-  onNewMessage: async ({ phoneHandle, text }) => {
-    await handleIMessageReply(supabase, applyQueue, saveRejectedJob, { phoneHandle, text });
-  },
-});
+async function main() {
+  console.log('====================================================');
+  console.log('  Dice Auto-Apply: iMessage Orchestrator (LoopMessage)');
+  console.log('  Deployment: Microsoft Azure (Headless Chromium)');
+  console.log('====================================================');
 
-// Start Background Loop
-runIMessageJobLoop().catch(err => {
-  console.error('[iMessage] Fatal error in job loop:', err.message);
+  // 1. Ensure default sender is recorded in database
+  await ensureDefaultSender(supabase);
+
+  // 2. Initialize Apply Queue and Workers
+  const applyQueue = createApplyQueue(supabase);
+  const workerController = startApplyWorkers({
+    queue: applyQueue,
+    concurrency: Number(process.env.APPLY_CONCURRENCY || 5),
+    executeJob: processQueuedApplyJob,
+    pollMs: 2000,
+  });
+
+  // 3. Create and start Express Webhook Ingress Server
+  const app = createWebhookApp(supabase, applyQueue);
+  const server = http.createServer(app);
+
+  server.listen(PORT, () => {
+    console.log(`[orchestrator] Webhook server listening on port ${PORT}`);
+    console.log(`[orchestrator] LoopMessage Webhook Ingress: POST http://localhost:${PORT}/webhook/loopmessage`);
+  });
+
+  // 4. Start Timed Interval Scheduler (18m timeout / 20m next job / 27m window / 20 jobs/day)
+  const scheduler = startIMessageScheduler(supabase, 15000);
+
+  // 5. Graceful shutdown handler
+  const shutdown = () => {
+    console.log('\n[orchestrator] Gracefully shutting down...');
+    scheduler.stop();
+    workerController.stop();
+    server.close(() => {
+      console.log('[orchestrator] HTTP server closed.');
+      process.exit(0);
+    });
+  };
+
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+}
+
+main().catch((err) => {
+  console.error('[orchestrator] Fatal initialization error:', err);
   process.exit(1);
 });
-
-// Graceful shutdown
-async function shutdown(signal) {
-  console.log(`[iMessage] ${signal} received — shutting down.`);
-  process.exit(0);
-}
-process.once('SIGINT',  () => shutdown('SIGINT'));
-process.once('SIGTERM', () => shutdown('SIGTERM'));
