@@ -9,6 +9,7 @@ const { openBrowser, closeBrowser, useBrowserbase, maxConcurrent } = require('./
 const { createApplyQueue } = require('./lib/apply-queue');
 const { startApplyWorkers } = require('./lib/apply-worker');
 const { jobMatchesProfile } = require('./lib/job-matching');
+const { createWorkflowStateStore } = require('./lib/workflow-state');
 
 const botToken = process.env.BOT_TOKEN;
 const allowedChatId = process.env.CHAT_ID ? Number(process.env.CHAT_ID) : null;
@@ -25,10 +26,14 @@ if (!dicePassword) {
 
 const supabase = createServiceClient();
 const applyQueue = createApplyQueue(supabase);
+const workflowStateStore = createWorkflowStateStore(supabase);
 let applyWorkerController = null;
 
 sgMail.setApiKey(sendGridApiKey);
 const loginUrl = 'https://www.dice.com/dashboard/login';
+const SESSION_MS = 9 * 60 * 60 * 1000;
+const DECISION_TIMEOUT_MS = 15 * 60 * 1000;
+const MIN_APPLY_WINDOW_MS = 30 * 60 * 1000;
 
 if (!botToken) {
   throw new Error('BOT_TOKEN must be set in the environment.');
@@ -48,6 +53,15 @@ function stateFor(chatId) {
       pendingJobUrl: {}, // Store URL by hash for button callbacks
       completionNotified: false,
       knownJobUrls: new Set(),
+      sessionStartedAt: null,
+      sessionDeadline: null,
+      consecutiveNoCount: 0,
+      nextScanAt: 0,
+      decisionTimer: null,
+      currentPromptToken: null,
+      currentPromptUrl: null,
+      currentPromptSentAt: null,
+      currentPromptExpiresAt: null,
     });
   }
   return userStates.get(chatId);
@@ -73,10 +87,64 @@ function waitForConversationReply(chatId) {
   });
 }
 
-function waitForDecision(chatId) {
+function waitForDecision(chatId, timeoutMs = DECISION_TIMEOUT_MS) {
   const state = stateFor(chatId);
   return new Promise((resolve) => {
-    state.decisionResolver = resolve;
+    const finish = (result) => {
+      if (state.decisionTimer) clearTimeout(state.decisionTimer);
+      state.decisionTimer = null;
+      state.decisionResolver = null;
+      resolve(result);
+    };
+
+    state.decisionResolver = (decision) => finish({
+      decision,
+      clickedAt: Date.now(),
+    });
+    state.decisionTimer = setTimeout(() => finish({
+      decision: null,
+      clickedAt: Date.now(),
+    }), timeoutMs);
+  });
+}
+
+function randomMinutes(min, max) {
+  return (min + Math.random() * (max - min)) * 60 * 1000;
+}
+
+async function waitUntil(timestamp) {
+  const remaining = timestamp - Date.now();
+  if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining));
+}
+
+async function hydrateWorkflowState(chatId) {
+  const state = stateFor(chatId);
+  const row = await workflowStateStore.get(chatId);
+  if (!row) return state;
+
+  state.sessionStartedAt = row.session_started_at ? Date.parse(row.session_started_at) : null;
+  state.sessionDeadline = row.session_deadline ? Date.parse(row.session_deadline) : null;
+  state.consecutiveNoCount = row.consecutive_no_count || 0;
+  state.nextScanAt = row.next_scan_at ? Date.parse(row.next_scan_at) : 0;
+  state.currentPromptToken = row.current_prompt_token;
+  state.currentPromptUrl = row.current_prompt_url;
+  state.currentPromptSentAt = row.current_prompt_sent_at ? Date.parse(row.current_prompt_sent_at) : null;
+  state.currentPromptExpiresAt = row.current_prompt_expires_at ? Date.parse(row.current_prompt_expires_at) : null;
+  return state;
+}
+
+async function persistWorkflowState(chatId, state, changes = {}) {
+  await workflowStateStore.save(chatId, {
+    session_started_at: state.sessionStartedAt ? new Date(state.sessionStartedAt).toISOString() : null,
+    session_deadline: state.sessionDeadline ? new Date(state.sessionDeadline).toISOString() : null,
+    consecutive_no_count: state.consecutiveNoCount,
+    next_scan_at: state.nextScanAt ? new Date(state.nextScanAt).toISOString() : null,
+    current_prompt_token: state.currentPromptToken,
+    current_prompt_url: state.currentPromptUrl,
+    current_prompt_sent_at: state.currentPromptSentAt ? new Date(state.currentPromptSentAt).toISOString() : null,
+    current_prompt_expires_at: state.currentPromptExpiresAt ? new Date(state.currentPromptExpiresAt).toISOString() : null,
+    ...changes,
+    updated_at: new Date().toISOString(),
   });
 }
 
@@ -597,10 +665,51 @@ async function executeQueuedApply(job) {
 // Background loop for an individual user: prompt Yes/No, enqueue on Yes.
 async function runJobsLoop(chatId) {
   const state = stateFor(chatId);
+  try {
+    await hydrateWorkflowState(chatId);
+  } catch (error) {
+    console.error(`[User ${chatId}] Could not restore workflow state:`, error.message);
+  }
   state.jobRunnerActive = true;
   console.log(`[User ${chatId}] Job loop started.`);
 
   while (state.jobRunnerActive) {
+    if (state.nextScanAt > Date.now()) {
+      await waitUntil(state.nextScanAt);
+      continue;
+    }
+
+    if (state.sessionDeadline && Date.now() >= state.sessionDeadline) {
+      if (!state.completionNotified) {
+        state.completionNotified = true;
+        await sendMessage(chatId, 'The 9-hour job application window has ended.');
+      }
+      await persistWorkflowState(chatId, state, {
+        last_decision: 'expired',
+        last_decision_at: new Date().toISOString(),
+      });
+      state.jobRunnerActive = false;
+      break;
+    }
+
+    if (state.currentPromptToken && state.currentPromptExpiresAt <= Date.now()) {
+      const missedUrl = state.currentPromptUrl;
+      const missedAt = state.currentPromptExpiresAt;
+      await workflowStateStore.recordDecision(chatId, state.currentPromptToken, 'missed', missedAt).catch(() => {});
+      state.currentPromptToken = null;
+      state.currentPromptUrl = null;
+      state.currentPromptSentAt = null;
+      state.currentPromptExpiresAt = null;
+      state.nextScanAt = Math.min(state.sessionDeadline, missedAt + randomMinutes(30, 40));
+      await persistWorkflowState(chatId, state, {
+        last_decision: 'missed',
+        last_decision_at: new Date(missedAt).toISOString(),
+      });
+      await saveAppliedJob(chatId, missedUrl, 'Job missed', 'missed');
+      await sendMessage(chatId, 'Job missed');
+      continue;
+    }
+
     const jobs = await readJobUrls();
     const urls = jobs.map((job) => job.url);
     const hasNewUrl = urls.some((url) => !state.knownJobUrls.has(url));
@@ -654,23 +763,105 @@ async function runJobsLoop(chatId) {
         break;
       }
 
-      console.log(`[User ${chatId}] Prompting for job: ${url}`);
+      if (state.sessionDeadline && Date.now() >= state.sessionDeadline) {
+        if (!state.completionNotified) {
+          state.completionNotified = true;
+          await sendMessage(chatId, 'The 9-hour job application window has ended.');
+        }
+        await persistWorkflowState(chatId, state, { last_decision: 'expired', last_decision_at: new Date().toISOString() });
+        state.jobRunnerActive = false;
+        break;
+      }
+
+      if (!state.sessionStartedAt) {
+        state.sessionStartedAt = Date.now();
+        state.sessionDeadline = state.sessionStartedAt + SESSION_MS;
+        state.consecutiveNoCount = 0;
+        await persistWorkflowState(chatId, state);
+      }
+
+      const isResumingPrompt = state.currentPromptToken && state.currentPromptUrl === url;
+      console.log(`[User ${chatId}] ${isResumingPrompt ? 'Resuming' : 'Prompting for'} job: ${url}`);
       offeredAny = true;
-      const jobHash = crypto.createHash('md5').update(url).digest('hex').substring(0, 16);
-      state.pendingJobUrl[jobHash] = url;
+      const promptToken = isResumingPrompt ? state.currentPromptToken : crypto.randomUUID();
+      state.pendingJobUrl[promptToken] = url;
+      const promptSentAt = isResumingPrompt ? state.currentPromptSentAt : Date.now();
+      const promptExpiresAt = isResumingPrompt
+        ? state.currentPromptExpiresAt
+        : Math.min(state.sessionDeadline, promptSentAt + DECISION_TIMEOUT_MS);
+      if (!isResumingPrompt) {
+        state.currentPromptToken = promptToken;
+        state.currentPromptUrl = url;
+        state.currentPromptSentAt = promptSentAt;
+        state.currentPromptExpiresAt = promptExpiresAt;
+        await workflowStateStore.recordPrompt(chatId, {
+          token: promptToken,
+          url,
+          sentAt: promptSentAt,
+          expiresAt: promptExpiresAt,
+        });
+        await persistWorkflowState(chatId, state);
+      }
 
       await sendMessageWithButtons(chatId, `New Job Found:\n${url}\n\nDo you want to apply?`, [
-        [{ text: '✅ Yes', callback_data: `job_yes_${jobHash}` }],
-        [{ text: '❌ No', callback_data: `job_no_${jobHash}` }],
+        [{ text: '✅ Yes', callback_data: `job_yes_${promptToken}` }],
+        [{ text: '❌ No', callback_data: `job_no_${promptToken}` }],
       ]);
 
-      const proceed = await waitForDecision(chatId);
+      const decisionWaitMs = Math.min(
+        DECISION_TIMEOUT_MS,
+        Math.max(0, state.sessionDeadline - promptSentAt)
+      );
+      const response = await waitForDecision(chatId, decisionWaitMs);
+      const clickAt = response.clickedAt || Date.now();
+      await persistWorkflowState(chatId, state, {
+        current_prompt_token: null,
+        current_prompt_url: null,
+        current_prompt_sent_at: null,
+        current_prompt_expires_at: null,
+        last_decision: response.decision === null ? 'missed' : response.decision ? 'yes' : 'no',
+        last_decision_at: new Date(clickAt).toISOString(),
+      });
+      state.currentPromptToken = null;
+      state.currentPromptUrl = null;
+      state.currentPromptSentAt = null;
+      state.currentPromptExpiresAt = null;
 
-      if (!proceed) {
+      if (response.decision === null) {
+        await saveAppliedJob(chatId, url, 'Job missed', 'missed');
+        await sendMessage(chatId, 'Job missed');
+        state.nextScanAt = Math.min(
+          state.sessionDeadline,
+          promptSentAt + randomMinutes(30, 40)
+        );
+        await persistWorkflowState(chatId, state);
+        break;
+      }
+
+      if (!response.decision) {
         await saveAppliedJob(chatId, url, 'Skipped by user', 'rejected');
         await sendMessage(chatId, 'Job rejected. Moving to next.');
-        continue;
+        state.consecutiveNoCount += 1;
+        state.nextScanAt = state.consecutiveNoCount >= 3
+          ? clickAt + randomMinutes(30, 40)
+          : clickAt;
+        if (state.nextScanAt >= state.sessionDeadline) state.nextScanAt = state.sessionDeadline;
+        await persistWorkflowState(chatId, state);
+        break;
       }
+
+      state.consecutiveNoCount = 0;
+      if (state.sessionDeadline - clickAt < MIN_APPLY_WINDOW_MS) {
+        await sendMessage(chatId, 'This job was not accepted because less than 30 minutes remain in your application window.');
+        state.nextScanAt = Math.min(
+          state.sessionDeadline,
+          clickAt + randomMinutes(30, 40)
+        );
+        await persistWorkflowState(chatId, state);
+        break;
+      }
+
+      await waitUntil(Date.now() + randomMinutes(15, 20));
 
       const { data: jobRow } = await supabase.from('jobs').select('id').eq('url', url).maybeSingle();
 
@@ -684,12 +875,16 @@ async function runJobsLoop(chatId) {
 
         if (activeClientJob) {
           await sendMessage(chatId, 'An application for this client is already running. I’ll offer the next job once it finishes.');
-          continue;
+          state.nextScanAt = clickAt + randomMinutes(30, 40);
+          await persistWorkflowState(chatId, state);
+          break;
         }
 
         if (alreadyDone) {
           await sendMessage(chatId, 'This job was already completed earlier. Skipping.');
-          continue;
+          state.nextScanAt = clickAt + randomMinutes(30, 40);
+          await persistWorkflowState(chatId, state);
+          break;
         }
 
         const position = created ? await applyQueue.getQueuePosition(row.id) : null;
@@ -699,9 +894,11 @@ async function runJobsLoop(chatId) {
             chatId,
             `Queued for apply (position ~${position}, ~${queuedCount || position} waiting).\nWorkers will pick this up when a browser slot is free.`
           );
+          state.nextScanAt = Math.min(state.sessionDeadline, clickAt + randomMinutes(30, 40));
           break;
         } else {
           await sendMessage(chatId, 'Already in the apply queue. Waiting for a worker...');
+          state.nextScanAt = Math.min(state.sessionDeadline, clickAt + randomMinutes(30, 40));
           break;
         }
       } catch (error) {
@@ -781,7 +978,7 @@ async function runSignInWorkflow(chatId, { greet = false } = {}) {
     }
 
     await deleteOTP(chatId);
-    await sendMessage(chatId, '✅ Email verified!');
+    await sendMessage(chatId, 'Email verified! /n your application process will start shortly');
 
     const user = await findUserByEmail(email);
     if (!user) {
@@ -789,15 +986,9 @@ async function runSignInWorkflow(chatId, { greet = false } = {}) {
     }
 
     await linkTelegramChat(chatId, user.id);
-    await sendMessage(
-      chatId,
-      useBrowserbase
-        ? 'Starting login in a remote Browserbase browser...'
-        : 'Starting login in a visible browser...'
-    );
+    
 
     await runLogin(chatId, { email, applywizz_id: user.applywizz_id, clientId: user.id });
-    await sendMessage(chatId, 'Login completed. I will now scan for jobs in the background.');
 
     state.workflowActive = false;
     if (!state.jobRunnerActive) {
@@ -816,13 +1007,11 @@ async function handleCommand(chatId, text) {
 
   if (['continue', 'yes', 'y'].includes(normalized) && state.decisionResolver) {
     const resolver = state.decisionResolver;
-    state.decisionResolver = null;
     resolver(true);
     return;
   }
   if (['stop', 'no', 'n'].includes(normalized) && state.decisionResolver) {
     const resolver = state.decisionResolver;
-    state.decisionResolver = null;
     resolver(false);
     return;
   }
@@ -903,18 +1092,28 @@ bot.on('callback_query', async (ctx) => {
 
   // Handle job yes/no buttons
   if (data.startsWith('job_yes_')) {
-    const resolver = stateFor(chatId).decisionResolver;
+    const state = stateFor(chatId);
+    const token = data.slice('job_yes_'.length);
+    if (state.currentPromptToken !== token || Date.now() >= state.currentPromptExpiresAt) return;
+    await workflowStateStore.recordDecision(chatId, token, 'yes', Date.now()).catch((error) => {
+      console.error(`[User ${chatId}] Failed to record Yes decision:`, error.message);
+    });
+    const resolver = state.decisionResolver;
     if (resolver) {
-      stateFor(chatId).decisionResolver = null;
       resolver(true);
     }
     return;
   }
 
   if (data.startsWith('job_no_')) {
-    const resolver = stateFor(chatId).decisionResolver;
+    const state = stateFor(chatId);
+    const token = data.slice('job_no_'.length);
+    if (state.currentPromptToken !== token || Date.now() >= state.currentPromptExpiresAt) return;
+    await workflowStateStore.recordDecision(chatId, token, 'no', Date.now()).catch((error) => {
+      console.error(`[User ${chatId}] Failed to record No decision:`, error.message);
+    });
+    const resolver = state.decisionResolver;
     if (resolver) {
-      stateFor(chatId).decisionResolver = null;
       resolver(false);
     }
     return;
