@@ -8,6 +8,7 @@ const { fillCurrentStep, isVisibleEnabled, loadApplyProfile } = require('./lib/d
 const { openBrowser, closeBrowser, useBrowserbase, maxConcurrent } = require('./lib/browser');
 const { createApplyQueue } = require('./lib/apply-queue');
 const { startApplyWorkers } = require('./lib/apply-worker');
+const { jobMatchesProfile } = require('./lib/job-matching');
 
 const botToken = process.env.BOT_TOKEN;
 const allowedChatId = process.env.CHAT_ID ? Number(process.env.CHAT_ID) : null;
@@ -338,7 +339,7 @@ async function refreshLogin(chatId) {
 async function readJobUrls() {
   const { data, error } = await supabase
     .from('jobs')
-    .select('url')
+    .select('url, Title, Company')
     .eq('active', true)
     .order('created_at', { ascending: true });
 
@@ -346,7 +347,11 @@ async function readJobUrls() {
     console.error('Failed to load jobs:', error.message);
     return [];
   }
-  return (data || []).map((row) => row.url);
+  return (data || []).map((job) => ({
+    url: job.url,
+    title: job.Title,
+    company: job.Company,
+  }));
 }
 
 async function saveAppliedJob(chatId, url, jobName, status) {
@@ -596,7 +601,8 @@ async function runJobsLoop(chatId) {
   console.log(`[User ${chatId}] Job loop started.`);
 
   while (state.jobRunnerActive) {
-    const urls = await readJobUrls();
+    const jobs = await readJobUrls();
+    const urls = jobs.map((job) => job.url);
     const hasNewUrl = urls.some((url) => !state.knownJobUrls.has(url));
     state.knownJobUrls = new Set(urls);
 
@@ -612,15 +618,21 @@ async function runJobsLoop(chatId) {
 
     let offeredAny = false;
     let unhandledUrlFound = false;
+    const clientId = await getClientIdForChat(chatId);
+    const applyProfile = clientId ? await loadApplyProfile(supabase, clientId) : {};
 
-    for (const url of urls) {
+    for (const job of jobs) {
+      const { url } = job;
       if (!state.jobRunnerActive) {
         console.log(`[User ${chatId}] Job runner stopped.`);
         break;
       }
 
       if (await hasHandledJob(chatId, url)) {
-        console.log(`[User ${chatId}] Skipping already-handled job: ${url}`);
+        continue;
+      }
+
+      if (!jobMatchesProfile(job, applyProfile)) {
         continue;
       }
 
@@ -632,15 +644,14 @@ async function runJobsLoop(chatId) {
         continue;
       }
 
-      const clientId = await getClientIdForChat(chatId);
       if (!clientId) {
         await sendMessage(chatId, 'Cannot queue apply: Telegram is not linked to a client.');
         continue;
       }
 
       if (await applyQueue.hasActiveClientJob(clientId)) {
-        console.log(`[User ${chatId}] Skipping additional prompt: client already has an active queued/running apply.`);
-        continue;
+        console.log(`[User ${chatId}] Waiting for the current application to finish.`);
+        break;
       }
 
       console.log(`[User ${chatId}] Prompting for job: ${url}`);
@@ -688,8 +699,10 @@ async function runJobsLoop(chatId) {
             chatId,
             `Queued for apply (position ~${position}, ~${queuedCount || position} waiting).\nWorkers will pick this up when a browser slot is free.`
           );
+          break;
         } else {
           await sendMessage(chatId, 'Already in the apply queue. Waiting for a worker...');
+          break;
         }
       } catch (error) {
         console.error(`[User ${chatId}] Enqueue failed:`, error.message);
@@ -697,7 +710,6 @@ async function runJobsLoop(chatId) {
       }
     }
 
-    const clientId = await getClientIdForChat(chatId);
     const activeClientJob = clientId && await applyQueue.hasActiveClientJob(clientId);
     if (
       urls.length > 0 &&
