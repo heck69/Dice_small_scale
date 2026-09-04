@@ -32,8 +32,9 @@ let applyWorkerController = null;
 sgMail.setApiKey(sendGridApiKey);
 const loginUrl = 'https://www.dice.com/dashboard/login';
 const SESSION_MS = 9 * 60 * 60 * 1000;
+const LINK_CUTOFF_MS = (8 * 60 + 32) * 60 * 1000;
 const DECISION_TIMEOUT_MS = 15 * 60 * 1000;
-const MIN_APPLY_WINDOW_MS = 30 * 60 * 1000;
+const NEXT_LINK_DELAY_MS = 28 * 60 * 1000;
 
 if (!botToken) {
   throw new Error('BOT_TOKEN must be set in the environment.');
@@ -148,6 +149,10 @@ async function persistWorkflowState(chatId, state, changes = {}) {
   });
 }
 
+function audit(chatId, event, details = {}) {
+  return workflowStateStore.log(chatId, event, details);
+}
+
 // === OTP HELPERS ===
 function generateOTP() {
   return crypto.randomInt(100000, 999999).toString();
@@ -190,7 +195,7 @@ async function deleteOTP(chatId) {
   if (error) console.error(`[User ${chatId}] Failed to delete OTP:`, error.message);
 }
 
-async function sendOTPEmail(email, otp) {
+async function sendOTPEmail(email, otp, chatId = null) {
   if (!sendGridApiKey) {
     console.warn('SendGrid API key not configured. OTP not sent via email.');
     return false;
@@ -203,6 +208,7 @@ async function sendOTPEmail(email, otp) {
       subject: 'Your OTP Verification Code',
       html: `<p>Your OTP code is: <strong>${otp}</strong></p><p>This code expires in 5 minutes.</p>`,
     });
+    if (chatId) await audit(chatId, 'otp_sent', { email }).catch(() => {});
     console.log(`[OTP] Sent to ${email}`);
     return true;
   } catch (error) {
@@ -344,6 +350,7 @@ async function runLogin(chatId, credentials, isBackgroundRefresh = false) {
   const { context, page, sessionId } = handle;
 
   try {
+    await audit(chatId, 'dice_login_started', { background: isBackgroundRefresh });
     if (sessionId) {
       console.log(`[User ${chatId}] Login browser session: ${sessionId}`);
       if (!isBackgroundRefresh) {
@@ -378,6 +385,7 @@ async function runLogin(chatId, credentials, isBackgroundRefresh = false) {
       credentials.clientId
     );
     console.log(`[User ${chatId}] Login completed successfully.`);
+    await audit(chatId, 'dice_login_completed');
     return savedSession;
   } finally {
     await closeBrowser(handle);
@@ -407,7 +415,7 @@ async function refreshLogin(chatId) {
 async function readJobUrls() {
   const { data, error } = await supabase
     .from('jobs')
-    .select('url, Title, Company')
+    .select('url, title, company, applywizz_id, company_email')
     .eq('active', true)
     .order('created_at', { ascending: true });
 
@@ -417,8 +425,10 @@ async function readJobUrls() {
   }
   return (data || []).map((job) => ({
     url: job.url,
-    title: job.Title,
-    company: job.Company,
+    title: job.title,
+    company: job.company,
+    applywizzId: job.applywizz_id,
+    companyEmail: job.company_email,
   }));
 }
 
@@ -745,8 +755,6 @@ async function runJobsLoop(chatId) {
         continue;
       }
 
-      unhandledUrlFound = true;
-
       if (state.workflowActive) {
         console.log(`[User ${chatId}] Workflow active, waiting 5s...`);
         await new Promise((r) => setTimeout(r, 5000));
@@ -758,12 +766,9 @@ async function runJobsLoop(chatId) {
         continue;
       }
 
-      if (await applyQueue.hasActiveClientJob(clientId)) {
-        console.log(`[User ${chatId}] Waiting for the current application to finish.`);
-        break;
-      }
-
-      if (state.sessionDeadline && Date.now() >= state.sessionDeadline) {
+      const linkCutoff = state.sessionStartedAt && state.sessionStartedAt + LINK_CUTOFF_MS;
+      const promptStillOpen = state.currentPromptToken && state.currentPromptExpiresAt > Date.now();
+      if (linkCutoff && Date.now() >= linkCutoff && !promptStillOpen) {
         if (!state.completionNotified) {
           state.completionNotified = true;
           await sendMessage(chatId, 'The 9-hour job application window has ended.');
@@ -779,6 +784,13 @@ async function runJobsLoop(chatId) {
         state.consecutiveNoCount = 0;
         await persistWorkflowState(chatId, state);
       }
+
+      if (String(job.applywizzId || '') !== String(applyProfile.applywizz_id || '')
+        || String(job.companyEmail || '').trim().toLowerCase() !== String(applyProfile.company_email || '').trim().toLowerCase()) {
+        continue;
+      }
+
+      unhandledUrlFound = true;
 
       const isResumingPrompt = state.currentPromptToken && state.currentPromptUrl === url;
       console.log(`[User ${chatId}] ${isResumingPrompt ? 'Resuming' : 'Prompting for'} job: ${url}`);
@@ -801,6 +813,7 @@ async function runJobsLoop(chatId) {
           expiresAt: promptExpiresAt,
         });
         await persistWorkflowState(chatId, state);
+        await audit(chatId, 'job_prompt_sent', { url, expiresAt: promptExpiresAt });
       }
 
       await sendMessageWithButtons(chatId, `New Job Found:\n${url}\n\nDo you want to apply?`, [
@@ -814,6 +827,10 @@ async function runJobsLoop(chatId) {
       );
       const response = await waitForDecision(chatId, decisionWaitMs);
       const clickAt = response.clickedAt || Date.now();
+      await audit(chatId, response.decision === null ? 'job_missed' : response.decision ? 'job_yes' : 'job_no', {
+        url,
+        clickedAt: new Date(clickAt).toISOString(),
+      });
       await persistWorkflowState(chatId, state, {
         current_prompt_token: null,
         current_prompt_url: null,
@@ -830,10 +847,7 @@ async function runJobsLoop(chatId) {
       if (response.decision === null) {
         await saveAppliedJob(chatId, url, 'Job missed', 'missed');
         await sendMessage(chatId, 'Job missed');
-        state.nextScanAt = Math.min(
-          state.sessionDeadline,
-          promptSentAt + randomMinutes(30, 40)
-        );
+        state.nextScanAt = Math.min(state.sessionDeadline, promptSentAt + DECISION_TIMEOUT_MS + NEXT_LINK_DELAY_MS);
         await persistWorkflowState(chatId, state);
         break;
       }
@@ -842,26 +856,20 @@ async function runJobsLoop(chatId) {
         await saveAppliedJob(chatId, url, 'Skipped by user', 'rejected');
         await sendMessage(chatId, 'Job rejected. Moving to next.');
         state.consecutiveNoCount += 1;
-        state.nextScanAt = state.consecutiveNoCount >= 3
-          ? clickAt + randomMinutes(30, 40)
-          : clickAt;
-        if (state.nextScanAt >= state.sessionDeadline) state.nextScanAt = state.sessionDeadline;
+        if (state.consecutiveNoCount >= 3) {
+          state.consecutiveNoCount = 0;
+          state.nextScanAt = Math.min(state.sessionDeadline, clickAt + NEXT_LINK_DELAY_MS);
+        } else {
+          state.nextScanAt = clickAt;
+        }
         await persistWorkflowState(chatId, state);
         break;
       }
 
       state.consecutiveNoCount = 0;
-      if (state.sessionDeadline - clickAt < MIN_APPLY_WINDOW_MS) {
-        await sendMessage(chatId, 'This job was not accepted because less than 30 minutes remain in your application window.');
-        state.nextScanAt = Math.min(
-          state.sessionDeadline,
-          clickAt + randomMinutes(30, 40)
-        );
-        await persistWorkflowState(chatId, state);
-        break;
-      }
 
-      await waitUntil(Date.now() + randomMinutes(15, 20));
+      const availableAt = Date.now() + randomMinutes(15, 20);
+      console.log(`[User ${chatId}] Yes accepted; automation available at ${new Date(availableAt).toISOString()}`);
 
       const { data: jobRow } = await supabase.from('jobs').select('id').eq('url', url).maybeSingle();
 
@@ -871,18 +879,20 @@ async function runJobsLoop(chatId) {
           telegramChatId: chatId,
           url,
           jobId: jobRow?.id || null,
+          availableAt: new Date(availableAt).toISOString(),
         });
+        await audit(chatId, 'job_queued', { url, queueId: row?.id || null, availableAt });
 
         if (activeClientJob) {
           await sendMessage(chatId, 'An application for this client is already running. I’ll offer the next job once it finishes.');
-          state.nextScanAt = clickAt + randomMinutes(30, 40);
+          state.nextScanAt = Math.min(state.sessionDeadline, clickAt + NEXT_LINK_DELAY_MS);
           await persistWorkflowState(chatId, state);
           break;
         }
 
         if (alreadyDone) {
           await sendMessage(chatId, 'This job was already completed earlier. Skipping.');
-          state.nextScanAt = clickAt + randomMinutes(30, 40);
+          state.nextScanAt = Math.min(state.sessionDeadline, clickAt + NEXT_LINK_DELAY_MS);
           await persistWorkflowState(chatId, state);
           break;
         }
@@ -894,11 +904,11 @@ async function runJobsLoop(chatId) {
             chatId,
             `Queued for apply (position ~${position}, ~${queuedCount || position} waiting).\nWorkers will pick this up when a browser slot is free.`
           );
-          state.nextScanAt = Math.min(state.sessionDeadline, clickAt + randomMinutes(30, 40));
+          state.nextScanAt = Math.min(state.sessionDeadline, clickAt + NEXT_LINK_DELAY_MS);
           break;
         } else {
           await sendMessage(chatId, 'Already in the apply queue. Waiting for a worker...');
-          state.nextScanAt = Math.min(state.sessionDeadline, clickAt + randomMinutes(30, 40));
+          state.nextScanAt = Math.min(state.sessionDeadline, clickAt + NEXT_LINK_DELAY_MS);
           break;
         }
       } catch (error) {
@@ -952,7 +962,7 @@ async function runSignInWorkflow(chatId, { greet = false } = {}) {
 
       const otp = generateOTP();
       await saveOTP(chatId, email, otp);
-      await sendOTPEmail(email, otp);
+      await sendOTPEmail(email, otp, chatId);
       await sendMessage(chatId, 'An OTP has been sent to your email. Please enter it below (expires in 5 minutes).');
 
       let otpVerified = false;
