@@ -424,9 +424,7 @@ async function refreshLogin(chatId) {
 async function readJobUrls() {
   const { data, error } = await supabase
     .from('jobs')
-    .select('url, title, company, applywizz_id, company_email')
-    .eq('active', true)
-    .order('created_at', { ascending: true });
+    .select('url, title, company, applywizz_id, company_email');
 
   if (error) {
     console.error('Failed to load jobs:', error.message);
