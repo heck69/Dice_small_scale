@@ -8,7 +8,6 @@ const { fillCurrentStep, isVisibleEnabled, loadApplyProfile } = require('./lib/d
 const { openBrowser, closeBrowser, useBrowserbase, maxConcurrent } = require('./lib/browser');
 const { createApplyQueue } = require('./lib/apply-queue');
 const { startApplyWorkers } = require('./lib/apply-worker');
-const { jobMatchesProfile } = require('./lib/job-matching');
 const { createWorkflowStateStore } = require('./lib/workflow-state');
 
 const botToken = process.env.BOT_TOKEN;
@@ -151,6 +150,16 @@ async function persistWorkflowState(chatId, state, changes = {}) {
 
 function audit(chatId, event, details = {}) {
   return workflowStateStore.log(chatId, event, details);
+}
+
+async function scheduleNextLink(chatId, state, nextScanAt, reason) {
+  state.nextScanAt = Math.min(state.sessionDeadline, nextScanAt);
+  await persistWorkflowState(chatId, state);
+  await audit(chatId, 'next_link_scheduled', {
+    reason,
+    scheduledAt: new Date(state.nextScanAt).toISOString(),
+    delayMs: Math.max(0, state.nextScanAt - Date.now()),
+  });
 }
 
 // === OTP HELPERS ===
@@ -751,10 +760,6 @@ async function runJobsLoop(chatId) {
         continue;
       }
 
-      if (!jobMatchesProfile(job, applyProfile)) {
-        continue;
-      }
-
       if (state.workflowActive) {
         console.log(`[User ${chatId}] Workflow active, waiting 5s...`);
         await new Promise((r) => setTimeout(r, 5000));
@@ -783,6 +788,11 @@ async function runJobsLoop(chatId) {
         state.sessionDeadline = state.sessionStartedAt + SESSION_MS;
         state.consecutiveNoCount = 0;
         await persistWorkflowState(chatId, state);
+        await audit(chatId, 'session_started', {
+          startedAt: new Date(state.sessionStartedAt).toISOString(),
+          deadlineAt: new Date(state.sessionDeadline).toISOString(),
+          linkCutoffAt: new Date(state.sessionStartedAt + LINK_CUTOFF_MS).toISOString(),
+        });
       }
 
       if (String(job.applywizzId || '') !== String(applyProfile.applywizz_id || '')
@@ -814,6 +824,12 @@ async function runJobsLoop(chatId) {
         });
         await persistWorkflowState(chatId, state);
         await audit(chatId, 'job_prompt_sent', { url, expiresAt: promptExpiresAt });
+        await audit(chatId, 'prompt_timer_started', {
+          url,
+          startedAt: new Date(promptSentAt).toISOString(),
+          expiresAt: new Date(promptExpiresAt).toISOString(),
+          durationMs: promptExpiresAt - promptSentAt,
+        });
       }
 
       await sendMessageWithButtons(chatId, `New Job Found:\n${url}\n\nDo you want to apply?`, [
@@ -849,6 +865,11 @@ async function runJobsLoop(chatId) {
         await sendMessage(chatId, 'Job missed');
         state.nextScanAt = Math.min(state.sessionDeadline, promptSentAt + DECISION_TIMEOUT_MS + NEXT_LINK_DELAY_MS);
         await persistWorkflowState(chatId, state);
+        await audit(chatId, 'next_link_scheduled', {
+          reason: 'job_missed',
+          scheduledAt: new Date(state.nextScanAt).toISOString(),
+          delayMs: state.nextScanAt - Date.now(),
+        });
         break;
       }
 
@@ -863,6 +884,11 @@ async function runJobsLoop(chatId) {
           state.nextScanAt = clickAt;
         }
         await persistWorkflowState(chatId, state);
+        await audit(chatId, 'next_link_scheduled', {
+          reason: state.consecutiveNoCount === 0 ? 'third_no' : 'no_response',
+          scheduledAt: new Date(state.nextScanAt).toISOString(),
+          delayMs: Math.max(0, state.nextScanAt - Date.now()),
+        });
         break;
       }
 
@@ -870,6 +896,12 @@ async function runJobsLoop(chatId) {
 
       const availableAt = Date.now() + randomMinutes(15, 20);
       console.log(`[User ${chatId}] Yes accepted; automation available at ${new Date(availableAt).toISOString()}`);
+      await audit(chatId, 'automation_delay_started', {
+        url,
+        startedAt: new Date().toISOString(),
+        availableAt: new Date(availableAt).toISOString(),
+        delayMs: availableAt - Date.now(),
+      });
 
       const { data: jobRow } = await supabase.from('jobs').select('id').eq('url', url).maybeSingle();
 
@@ -887,6 +919,11 @@ async function runJobsLoop(chatId) {
           await sendMessage(chatId, 'An application for this client is already running. I’ll offer the next job once it finishes.');
           state.nextScanAt = Math.min(state.sessionDeadline, clickAt + NEXT_LINK_DELAY_MS);
           await persistWorkflowState(chatId, state);
+          await audit(chatId, 'next_link_scheduled', {
+            reason: 'yes',
+            scheduledAt: new Date(state.nextScanAt).toISOString(),
+            delayMs: Math.max(0, state.nextScanAt - Date.now()),
+          });
           break;
         }
 
@@ -894,6 +931,11 @@ async function runJobsLoop(chatId) {
           await sendMessage(chatId, 'This job was already completed earlier. Skipping.');
           state.nextScanAt = Math.min(state.sessionDeadline, clickAt + NEXT_LINK_DELAY_MS);
           await persistWorkflowState(chatId, state);
+          await audit(chatId, 'next_link_scheduled', {
+            reason: 'yes',
+            scheduledAt: new Date(state.nextScanAt).toISOString(),
+            delayMs: Math.max(0, state.nextScanAt - Date.now()),
+          });
           break;
         }
 
@@ -905,10 +947,20 @@ async function runJobsLoop(chatId) {
             `Queued for apply (position ~${position}, ~${queuedCount || position} waiting).\nWorkers will pick this up when a browser slot is free.`
           );
           state.nextScanAt = Math.min(state.sessionDeadline, clickAt + NEXT_LINK_DELAY_MS);
+          await audit(chatId, 'next_link_scheduled', {
+            reason: 'yes',
+            scheduledAt: new Date(state.nextScanAt).toISOString(),
+            delayMs: Math.max(0, state.nextScanAt - Date.now()),
+          });
           break;
         } else {
           await sendMessage(chatId, 'Already in the apply queue. Waiting for a worker...');
           state.nextScanAt = Math.min(state.sessionDeadline, clickAt + NEXT_LINK_DELAY_MS);
+          await audit(chatId, 'next_link_scheduled', {
+            reason: 'yes_existing_queue',
+            scheduledAt: new Date(state.nextScanAt).toISOString(),
+            delayMs: Math.max(0, state.nextScanAt - Date.now()),
+          });
           break;
         }
       } catch (error) {
@@ -1149,6 +1201,7 @@ bot.on('callback_query', async (ctx) => {
   applyWorkerController = startApplyWorkers({
     queue: applyQueue,
     executeJob: executeQueuedApply,
+    audit,
     concurrency: maxConcurrent,
     pollMs: 2000,
   });
