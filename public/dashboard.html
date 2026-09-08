@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Workflow dashboard</title>
+  <link rel="stylesheet" href="/dashboard.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Operations</p>
+        <h1>Workflow dashboard</h1>
+        <p class="muted" id="status">Loading...</p>
+      </div>
+      <button class="button secondary" id="logout">Log out</button>
+    </header>
+
+    <section class="controls" aria-label="Dashboard filters">
+      <label>Date <input type="date" id="date"></label>
+      <label>Timezone
+        <select id="timezone">
+          <option value="browser">Browser local</option>
+          <option value="UTC">UTC</option>
+          <option value="Pacific">Pacific</option>
+          <option value="Mountain">Mountain</option>
+          <option value="Central">Central</option>
+          <option value="Eastern">Eastern</option>
+        </select>
+      </label>
+      <div class="summary" id="summary"></div>
+    </section>
+
+    <section id="login" class="login-panel" hidden>
+      <h2>Operator sign in</h2>
+      <form id="login-form">
+        <label>Email <input type="email" id="email" required autocomplete="username"></label>
+        <label>Password <input type="password" id="password" required autocomplete="current-password"></label>
+        <button class="button" type="submit">Sign in</button>
+        <p class="error" id="login-error"></p>
+      </form>
+    </section>
+
+    <section id="users" class="users" hidden></section>
+  </main>
+  <script src="/dashboard.js"></script>
+</body>
+</html>

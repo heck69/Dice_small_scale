@@ -3,7 +3,8 @@ require('dotenv').config();
 const crypto = require('crypto');
 const { Bot } = require('node-telegram-bot-api');
 const sgMail = require('@sendgrid/mail');
-const { createServiceClient } = require('./lib/supabase');
+const { createPool, createServiceClient } = require('./lib/supabase');
+const { createDashboardServer } = require('./lib/dashboard-server');
 const { fillCurrentStep, isVisibleEnabled, loadApplyProfile } = require('./lib/dice-apply-questions');
 const { openBrowser, closeBrowser, useBrowserbase, maxConcurrent } = require('./lib/browser');
 const { createApplyQueue } = require('./lib/apply-queue');
@@ -24,6 +25,7 @@ if (!dicePassword) {
 }
 
 const supabase = createServiceClient();
+const dashboardServer = createDashboardServer({ db: createPool() });
 const applyQueue = createApplyQueue(supabase);
 const workflowStateStore = createWorkflowStateStore(supabase);
 let applyWorkerController = null;
@@ -1182,6 +1184,11 @@ bot.on('callback_query', async (ctx) => {
 
 // === BOOTSTRAP ===
 (async () => {
+  const dashboardPort = Number(process.env.PORT || 3000);
+  dashboardServer.listen(dashboardPort, '0.0.0.0', () => {
+    console.log(`[Init] Dashboard listening on port ${dashboardPort} at /dashboard`);
+  });
+
   console.log('[Init] Testing bot token...');
   try {
     await bot.api.getMe();
@@ -1230,6 +1237,7 @@ async function shutdown() {
     state.jobRunnerActive = false;
   }
   if (bot.isRunning()) await bot.stopPolling().catch(() => { });
+  await new Promise((resolve) => dashboardServer.close(resolve));
 }
 
 process.once('SIGINT', shutdown);
