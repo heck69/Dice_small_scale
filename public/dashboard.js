@@ -86,7 +86,7 @@ function showLogin() {
 
 function startPolling() {
   if (state.timer) return;
-  state.timer = setInterval(loadDashboard, 5000);
+  state.timer = setInterval(loadDashboard, 30 * 60 * 1000);
 }
 
 function startTimers() {
