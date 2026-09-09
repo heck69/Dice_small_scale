@@ -74,8 +74,14 @@ function stateFor(chatId) {
 }
 
 // === TELEGRAM HELPERS ===
-function sendMessage(chatId, text, options = {}) {
-  return bot.api.sendMessage({ chat_id: chatId, text, ...options }).catch(console.error);
+async function sendMessage(chatId, text, options = {}) {
+  try {
+    await bot.api.sendMessage({ chat_id: chatId, text, ...options });
+    return true;
+  } catch (error) {
+    console.error(`[User ${chatId}] Telegram message failed:`, error.message);
+    return false;
+  }
 }
 
 function sendMessageWithButtons(chatId, text, buttons) {
@@ -136,6 +142,7 @@ async function hydrateWorkflowState(chatId) {
   state.currentPromptUrl = row.current_prompt_url;
   state.currentPromptSentAt = row.current_prompt_sent_at ? Date.parse(row.current_prompt_sent_at) : null;
   state.currentPromptExpiresAt = row.current_prompt_expires_at ? Date.parse(row.current_prompt_expires_at) : null;
+  state.newdayRequestedAt = row.newday_requested_at ? Date.parse(row.newday_requested_at) : null;
   return state;
 }
 
@@ -149,6 +156,7 @@ async function persistWorkflowState(chatId, state, changes = {}) {
     current_prompt_url: state.currentPromptUrl,
     current_prompt_sent_at: state.currentPromptSentAt ? new Date(state.currentPromptSentAt).toISOString() : null,
     current_prompt_expires_at: state.currentPromptExpiresAt ? new Date(state.currentPromptExpiresAt).toISOString() : null,
+    newday_requested_at: state.newdayRequestedAt ? new Date(state.newdayRequestedAt).toISOString() : null,
     ...changes,
     updated_at: new Date().toISOString(),
   });
@@ -983,19 +991,26 @@ async function runJobsLoop(chatId) {
       }
     }
 
-    const activeClientJob = clientId && await applyQueue.hasActiveClientJob(clientId);
+    const activeClientJob = clientId
+      ? await applyQueue.hasActiveClientJob(clientId)
+      : false;
+    const allRecentJobsHandled = urls.length > 0 && !unhandledUrlFound && !activeClientJob;
     if (
-      urls.length > 0 &&
-      !unhandledUrlFound &&
-      !activeClientJob &&
+      allRecentJobsHandled &&
       !state.completionNotified &&
-      state.jobRunnerActive
+      state.jobRunnerActive &&
+      state.runGeneration === runGeneration
     ) {
-      state.completionNotified = true;
-      await sendMessage(
+      const details = {
+        jobCount: urls.length,
+        checkedAt: new Date().toISOString(),
+      };
+      await audit(chatId, 'all_jobs_completed', details);
+      const sent = await sendMessage(
         chatId,
         'All jobs from the CSV have been completed. I will wait for new job links.'
       );
+      if (sent) state.completionNotified = true;
     }
 
     if (!offeredAny && state.jobRunnerActive) {
